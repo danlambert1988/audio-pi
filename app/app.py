@@ -194,10 +194,7 @@ def detect_mixer() -> dict:
 
 
 def get_volume_percent() -> int:
-    d = detect_mixer()
-    card = d["card"]
-    mixer = d["mixer"]
-    out = sh(f"amixer -c {card} get '{mixer}' 2>/dev/null | grep -oE '[0-9]+%' | head -n1 | tr -d '%'")
+    out = sh("amixer -c 0 get PCM | grep -oE '[0-9]+%' | head -n1 | tr -d '%'")
     try:
         return int(out)
     except Exception:
@@ -205,12 +202,8 @@ def get_volume_percent() -> int:
 
 
 def set_volume_percent(value: int) -> int:
-    d = detect_mixer()
-    card = d["card"]
-    mixer = d["mixer"]
     value = max(0, min(100, value))
-    # Use sudo amixer so it always works from the service user
-    run(["sudo", "/usr/bin/amixer", "-c", str(card), "set", mixer, f"{value}%", "unmute"])
+    run(["sudo", "/usr/bin/amixer", "-c", "0", "set", "PCM", f"{value}%", "unmute"])
     return get_volume_percent()
 
 

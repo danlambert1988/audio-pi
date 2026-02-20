@@ -193,18 +193,40 @@ def detect_mixer() -> dict:
     return _DETECTED
 
 
-def get_volume_percent() -> int:
+def get_hw_pcm() -> int:
     out = sh("amixer -c 0 get PCM | grep -oE '[0-9]+%' | head -n1 | tr -d '%'")
     try:
         return int(out)
     except Exception:
         return 0
 
+def ui_to_hw(ui: int) -> int:
+    ui = max(0, min(100, ui))
+    if ui == 0:
+        return 0
+    # Map 1..100 -> 70..100
+    return 70 + int((ui / 100) * 30)
+
+def hw_to_ui(hw: int) -> int:
+    hw = max(0, min(100, hw))
+    if hw <= 0:
+        return 0
+    if hw <= 70:
+        return 1
+    # Map 70..100 -> 1..100
+    return int(((hw - 70) / 30) * 100)
+
+def get_volume_percent() -> int:
+    return hw_to_ui(get_hw_pcm())
 
 def set_volume_percent(value: int) -> int:
-    value = max(0, min(100, value))
-    run(["sudo", "/usr/bin/amixer", "-c", "0", "set", "PCM", f"{value}%", "unmute"])
-    return get_volume_percent()
+    ui = max(0, min(100, value))
+    hw = ui_to_hw(ui)
+    if ui == 0:
+        run(["sudo", "/usr/bin/amixer", "-c", "0", "set", "PCM", "0%", "mute"])
+    else:
+        run(["sudo", "/usr/bin/amixer", "-c", "0", "set", "PCM", f"{hw}%", "unmute"])
+    return ui
 
 
 # -----------------------

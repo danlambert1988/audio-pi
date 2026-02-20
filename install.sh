@@ -9,6 +9,16 @@ echo
 sudo apt update
 sudo apt install -y snapserver snapclient shairport-sync bluez pulseaudio-utils rfkill
 
+# Android Wi-Fi casting support (DLNA/UPnP renderer)
+sudo apt install -y gmediarender || sudo apt install -y gmrender-resurrect
+
+sudo systemctl enable gmediarender || sudo systemctl enable gmrender-resurrect
+sudo systemctl restart gmediarender || sudo systemctl restart gmrender-resurrect || true
+
+# Try to set a friendly name (works on many builds)
+sudo sh -c 'printf "GMRENDER_FRIENDLY_NAME=Audio-Pi\n" > /etc/default/gmediarender' || true
+sudo systemctl restart gmediarender || sudo systemctl restart gmrender-resurrect || true
+
 # 2) Force analog audio default (Pi 3.5mm)
 CFG="/boot/firmware/config.txt"
 sudo touch "$CFG"

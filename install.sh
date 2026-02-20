@@ -64,8 +64,10 @@ apt-get install -y \
 apt-get install -y \
   snapserver snapclient \
   shairport-sync \
-  bluetooth bluez bluez-tools \
-  raspotify || true
+  bluetooth bluez bluez-tools || true
+
+# Spotify Connect (optional)
+apt-get install -y raspotify || true
 
 # DLNA/UPnP renderer (Android casting)
 apt-get install -y gmediarender || apt-get install -y gmrender-resurrect
@@ -104,11 +106,13 @@ fi
 log "Ensuring onboard audio is enabled (safe default)"
 CFG="/boot/firmware/config.txt"
 touch "$CFG"
+
 if ! grep -q '^dtparam=audio=on' "$CFG"; then
   echo 'dtparam=audio=on' >> "$CFG"
   REBOOT_REQUIRED=1
 fi
-# Remove any previous forced HDMI audio disable
+
+# Remove any previous forced HDMI audio disable (if present from earlier experiments)
 if grep -q '^hdmi_ignore_edid_audio=1' "$CFG"; then
   sed -i '/^hdmi_ignore_edid_audio=1/d' "$CFG" || true
   REBOOT_REQUIRED=1
@@ -120,7 +124,6 @@ fi
 log "Configuring Shairport to output to stdout for Snapcast"
 SHAIR="/etc/shairport-sync.conf"
 if [[ -f "$SHAIR" ]]; then
-  # best effort - ensure output_backend is stdout
   sed -i 's/output_backend *= *"alsa"/output_backend = "stdout"/' "$SHAIR" || true
   sed -i 's/output_backend *= *"pipe"/output_backend = "stdout"/' "$SHAIR" || true
   if ! grep -q 'output_backend' "$SHAIR"; then
@@ -220,6 +223,7 @@ if [[ ! -d "${SCRIPT_DIR}/app" ]]; then
 fi
 
 rsync -a --delete "${SCRIPT_DIR}/app/" "${APP_DIR}/app/"
+
 if [[ -d "${SCRIPT_DIR}/scripts" ]]; then
   rsync -a --delete "${SCRIPT_DIR}/scripts/" "${APP_DIR}/scripts/"
   chmod +x "${APP_DIR}/scripts/"*.sh 2>/dev/null || true
@@ -306,6 +310,7 @@ systemctl enable --now audio-pi-web.service
 # -----------------------
 log "Configuring nginx reverse proxy (port 80 -> 8080)"
 rm -f /etc/nginx/sites-enabled/default || true
+
 cat <<'NG' > "${NGINX_SITE_AVAIL}"
 server {
   listen 80 default_server;
@@ -319,6 +324,7 @@ server {
   }
 }
 NG
+
 ln -sf "${NGINX_SITE_AVAIL}" "${NGINX_SITE_ENABLED}"
 nginx -t
 systemctl enable --now nginx

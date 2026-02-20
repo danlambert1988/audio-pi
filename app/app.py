@@ -1,7 +1,10 @@
 import os
 import json
+import re
+import math
 import subprocess
 from typing import Optional, List, Dict, Any
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -9,21 +12,31 @@ from pydantic import BaseModel
 
 # ------------------------------------------------------------
 # Audio-Pi Web Backend (FastAPI)
-# - Serves static UI at /
-# - Provides REST API for:
-#     - State/status
-#     - Volume control (auto-detects mixer/card, supports Pi headphone jack)
-#     - Service control (via sudo allowlist)
-#     - Multiroom mode toggle (server/client/off)
-#     - Wi-Fi scan/connect (nmcli)
 #
-# IMPORTANT:
-#   - Your systemd service runs as user: audio-pi
-#   - You MUST have sudoers rules allowing audio-pi to run:
-#       /usr/bin/systemctl (start/stop/restart/enable/disable)
-#       /usr/bin/nmcli
-#       /usr/bin/amixer
-#       /usr/sbin/reboot
+# Features:
+# - Serves static UI at /
+# - REST API:
+#     - /api/state                    : device name, volume, service status
+#     - /api/volume/{value}           : set volume 0..100 (dB-scaled for sane slider)
+#     - /api/service/{name}/{action}  : start/stop/restart services (sudo allowlist)
+#     - /api/multiroom/{mode}         : server/client/off snapcast toggles (optional)
+#     - /api/wifi/scan                : scan networks (nmcli)
+#     - /api/wifi/connect             : connect to network (nmcli)
+#     - /api/device-name              : save friendly device name
+#     - /api/reboot                   : reboot device
+#
+# Audio notes:
+# - Pi headphone output volume is very non-linear in "%".
+# - This backend sets volume in dB on ALSA card 0 "PCM" to give a usable 0..100 slider.
+#
+# Permissions:
+# - systemd service runs as User=audio-pi (per your setup)
+# - You MUST have sudoers allowlist for:
+#     /usr/bin/systemctl
+#     /usr/bin/nmcli
+#     /usr/bin/amixer
+#     /usr/sbin/reboot
+#
 # ------------------------------------------------------------
 
 BASE_DIR = os.path.dirname(__file__)
@@ -46,25 +59,46 @@ class DeviceName(BaseModel):
 
 
 # -----------------------
-# Helpers
+# Command helpers
 # -----------------------
 def run(cmd: List[str], check: bool = False) -> subprocess.CompletedProcess:
-    """
-    Run a command without shell, capturing output.
-    """
     return subprocess.run(cmd, text=True, capture_output=True, check=check)
 
 
 def sh(cmd: str) -> str:
-    """
-    Run a shell command (only used for simple parsing).
-    """
     try:
         return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT).strip()
     except subprocess.CalledProcessError as e:
         return (e.output or "").strip()
 
 
+def systemctl(args: List[str]) -> Dict[str, Any]:
+    """
+    Run systemctl via sudo (audio-pi user needs sudoers allowlist).
+    """
+    p = run(["sudo", "/usr/bin/systemctl"] + args)
+    ok = (p.returncode == 0)
+    return {
+        "ok": ok,
+        "stdout": (p.stdout or "").strip(),
+        "stderr": (p.stderr or "").strip(),
+        "code": p.returncode,
+    }
+
+
+def service_status(unit: str) -> str:
+    p = run(["/usr/bin/systemctl", "is-active", unit])
+    return (p.stdout or "").strip() or "unknown"
+
+
+def service_enabled(unit: str) -> str:
+    p = run(["/usr/bin/systemctl", "is-enabled", unit])
+    return (p.stdout or "").strip() or "unknown"
+
+
+# -----------------------
+# Config helpers
+# -----------------------
 def load_config() -> Dict[str, Any]:
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -79,153 +113,99 @@ def save_config(data: Dict[str, Any]) -> None:
         json.dump(data, f, indent=2)
 
 
-def systemctl(args: List[str]) -> Dict[str, Any]:
-    """
-    Run systemctl via sudo (audio-pi user needs sudoers allowlist).
-    """
-    p = run(["sudo", "/usr/bin/systemctl"] + args)
-    ok = (p.returncode == 0)
-    return {"ok": ok, "stdout": (p.stdout or "").strip(), "stderr": (p.stderr or "").strip(), "code": p.returncode}
-
-
-def service_status(unit: str) -> str:
-    p = run(["/usr/bin/systemctl", "is-active", unit])
-    return (p.stdout or "").strip() or "unknown"
-
-
-def service_enabled(unit: str) -> str:
-    p = run(["/usr/bin/systemctl", "is-enabled", unit])
-    return (p.stdout or "").strip() or "unknown"
-
-
 # -----------------------
-# ALSA volume detection
+# Volume (dB-scaled) - ALSA card 0, mixer PCM
 # -----------------------
-# Cache detected mixer/card so UI is responsive
-_DETECTED: Dict[str, Any] = {"card": None, "mixer": None}
+# On your Pi, we confirmed:
+#   card 0: Headphones (bcm2835 Headphones)
+#   mixer control: PCM
+#
+# Using dB provides a smooth 0..100 slider vs the non-linear % curve.
+_PCM_DB_CACHE: Dict[str, Optional[int]] = {"min": None, "max": None}  # 0.01 dB units from ALSA
 
 
-def list_cards() -> List[int]:
+def _pcm_db_limits() -> (int, int):
     """
-    Return ALSA card numbers present (best effort).
+    Parse ALSA PCM limits:
+      "Limits: Playback -10239 - 400"
+    returns: (min, max) in 0.01 dB units
     """
-    out = sh("aplay -l 2>/dev/null | sed -n 's/^card \\([0-9]\\+\\):.*/\\1/p' | sort -n | uniq")
-    cards = []
-    for line in out.splitlines():
-        try:
-            cards.append(int(line.strip()))
-        except Exception:
-            pass
-    return cards or [0]
+    out = sh("amixer -c 0 get PCM 2>/dev/null | grep -m1 'Limits:' || true")
+    m = re.search(r"Limits:\s*Playback\s*(-?\d+)\s*-\s*(-?\d+)", out)
+    if not m:
+        # safe fallback: -50.00 dB .. +4.00 dB
+        return (-5000, 400)
+    return (int(m.group(1)), int(m.group(2)))
 
 
-def list_mixers(card: int) -> List[str]:
+def _ensure_pcm_db_cache():
+    if _PCM_DB_CACHE["min"] is None or _PCM_DB_CACHE["max"] is None:
+        mn, mx = _pcm_db_limits()
+        _PCM_DB_CACHE["min"], _PCM_DB_CACHE["max"] = mn, mx
+
+
+def _get_pcm_db_value() -> Optional[float]:
     """
-    Return simple mixer control names for a given ALSA card.
+    Returns current PCM level in dB if available (e.g. 4.00), else None.
     """
-    out = sh(f"amixer -c {card} scontrols 2>/dev/null")
-    names = []
-    for line in out.splitlines():
-        # Example: Simple mixer control 'PCM',0
-        if "'" in line:
-            parts = line.split("'")
-            if len(parts) >= 2:
-                names.append(parts[1])
-    return names
+    out = sh(
+        "amixer -c 0 get PCM 2>/dev/null "
+        "| grep -oE '\\[-?[0-9]+\\.[0-9]+dB\\]' | head -n1 | tr -d '[]dB' || true"
+    )
+    try:
+        return float(out)
+    except Exception:
+        return None
 
 
-def detect_mixer() -> dict:
-    """
-    Prefer bcm2835 Headphones card if present, then fall back.
-    """
-    if _DETECTED["card"] is not None and _DETECTED["mixer"] is not None:
-        return _DETECTED
-
-    preferred_mixers = ["PCM", "Headphone", "Master", "Digital"]
-
-    # Find card numbers + names
-    # Example aplay -l line: "card 0: Headphones [bcm2835 Headphones], device 0: ..."
-    cards_info = sh("aplay -l 2>/dev/null | sed -n 's/^card \\([0-9]\\+\\): \\([^[]\\+\\)\\[\\([^]]\\+\\)\\].*/\\1|\\3/p'").splitlines()
-    # cards_info -> ["0|bcm2835 Headphones", "1|vc4-hdmi-0", ...]
-
-    # Prefer headphone card if present
-    preferred_cards = []
-    for line in cards_info:
-        try:
-            num_str, name = line.split("|", 1)
-            num = int(num_str.strip())
-            if "Headphones" in name or "bcm2835" in name:
-                preferred_cards.append(num)
-        except:
-            pass
-
-    # Then add all other cards as fallback
-    for c in list_cards():
-        if c not in preferred_cards:
-            preferred_cards.append(c)
-
-    # Now pick the first preferred mixer on the best card
-    for card in preferred_cards:
-        mixers = list_mixers(card)
-        for m in preferred_mixers:
-            if m in mixers:
-                _DETECTED["card"] = card
-                _DETECTED["mixer"] = m
-                return _DETECTED
-
-    # Final fallback
-    _DETECTED["card"] = preferred_cards[0] if preferred_cards else 0
-    _DETECTED["mixer"] = "Master"
-    return _DETECTED
-
-    preferred_mixers = ["PCM", "Headphone", "Master", "Digital"]
-    for card in list_cards():
-        mixers = list_mixers(card)
-        for m in preferred_mixers:
-            if m in mixers:
-                _DETECTED["card"] = card
-                _DETECTED["mixer"] = m
-                return _DETECTED
-
-    # Fallback: card 0, Master
-    _DETECTED["card"] = 0
-    _DETECTED["mixer"] = "Master"
-    return _DETECTED
-
-
-def _get_hw_pcm() -> int:
-    out = sh("amixer -c 0 get PCM | grep -oE '[0-9]+%' | head -n1 | tr -d '%'")
+def _get_pcm_percent_value() -> Optional[int]:
+    out = sh("amixer -c 0 get PCM 2>/dev/null | grep -oE '[0-9]+%' | head -n1 | tr -d '%' || true")
     try:
         return int(out)
     except Exception:
-        return 0
+        return None
 
-def _ui_to_hw(ui: int) -> int:
-    ui = max(0, min(100, ui))
-    if ui == 0:
-        return 0
-    # 1..100 -> 70..100 (spread across full slider)
-    return 70 + int((ui / 100) * 30)
-
-def _hw_to_ui(hw: int) -> int:
-    hw = max(0, min(100, hw))
-    if hw == 0:
-        return 0
-    if hw <= 70:
-        return 1
-    return int(((hw - 70) / 30) * 100)
 
 def get_volume_percent() -> int:
-    return _hw_to_ui(_get_hw_pcm())
+    """
+    Returns UI volume 0..100 (based on dB mapping).
+    """
+    db = _get_pcm_db_value()
+    if db is None:
+        # percent fallback (still returns something)
+        p = _get_pcm_percent_value()
+        return int(p) if p is not None else 0
+
+    # Use a nice user-facing range: -50dB..+4dB
+    min_db = -50.0
+    max_db = 4.0
+    db = max(min_db, min(max_db, db))
+    ui = int(round((db - min_db) / (max_db - min_db) * 100))
+    return max(0, min(100, ui))
+
 
 def set_volume_percent(value: int) -> int:
-    ui = max(0, min(100, value))
-    hw = _ui_to_hw(ui)
-    if ui == 0:
-        run(["sudo", "/usr/bin/amixer", "-c", "0", "set", "PCM", "0%", "mute"])
-    else:
-        run(["sudo", "/usr/bin/amixer", "-c", "0", "set", "PCM", f"{hw}%", "unmute"])
-    return ui
+    """
+    Sets volume using dB for a smooth slider.
+    """
+    value = max(0, min(100, value))
+
+    # Tune these if you want:
+    min_db = -50.0   # quieter floor (use -60.0 if you want quieter minimum)
+    max_db = 4.0     # matches your observed 100% = +4dB
+
+    if value == 0:
+        run(["sudo", "/usr/bin/amixer", "-c", "0", "set", "PCM", "mute"])
+        return 0
+
+    # Gamma curve: makes low-end more usable (0.6 gives more resolution at low volumes)
+    x = value / 100.0
+    gamma = 0.6
+    x = math.pow(x, gamma)
+
+    target_db = min_db + x * (max_db - min_db)
+    run(["sudo", "/usr/bin/amixer", "-c", "0", "set", "PCM", f"{target_db:.2f}dB", "unmute"])
+    return value
 
 
 # -----------------------
@@ -239,12 +219,10 @@ def root():
 @app.get("/api/state")
 def state():
     cfg = load_config()
-    det = detect_mixer()
-
     return {
         "device_name": cfg.get("device_name", "Audio-Pi"),
         "volume": get_volume_percent(),
-        "mixer": {"card": det["card"], "control": det["mixer"]},
+        "audio": {"card": 0, "mixer": "PCM"},
         "services": {
             "bluetooth": service_status("bluetooth"),
             "airplay": service_status("shairport-sync"),
@@ -318,13 +296,12 @@ def api_multiroom(mode: str):
         "enabled": {
             "snapserver": service_enabled("snapserver"),
             "snapclient": service_enabled("snapclient"),
-        }
+        },
     }
 
 
 @app.get("/api/wifi/scan")
 def wifi_scan():
-    # nmcli output is easiest in terse mode
     p = run(["sudo", "/usr/bin/nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"])
     if p.returncode != 0:
         return {"ok": False, "error": (p.stderr or p.stdout or "").strip(), "networks": []}
@@ -335,7 +312,7 @@ def wifi_scan():
         if len(parts) >= 3 and parts[0]:
             networks.append({"ssid": parts[0], "signal": parts[1], "security": parts[2]})
 
-    # de-dupe by SSID, keep strongest signal
+    # de-dupe by SSID, keep strongest
     best: Dict[str, Dict[str, str]] = {}
     for n in networks:
         ssid = n["ssid"]

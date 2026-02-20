@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio-Pi</title>
+
+<style>
+body {
+    background:#0f1116;
+    color:#e8e8e8;
+    font-family:system-ui,-apple-system,Segoe UI,Roboto;
+    margin:0;
+    padding:20px;
+}
+
+h1 {
+    margin-top:0;
+    font-size:28px;
+}
+
+.card {
+    background:#1a1f27;
+    padding:16px;
+    border-radius:12px;
+    margin-bottom:16px;
+}
+
+button {
+    background:#2b3442;
+    border:none;
+    padding:10px 14px;
+    color:white;
+    border-radius:8px;
+    cursor:pointer;
+    margin:4px 4px 4px 0;
+}
+
+button:hover {
+    background:#3b4759;
+}
+
+input[type="range"] {
+    width:100%;
+}
+
+input[type="text"], input[type="password"] {
+    padding:8px;
+    border-radius:6px;
+    border:none;
+    margin-right:8px;
+    margin-top:6px;
+    width:180px;
+}
+
+.status {
+    font-size:14px;
+    opacity:0.8;
+    margin-top:6px;
+}
+.small {
+    font-size:13px;
+    opacity:0.7;
+}
+</style>
+</head>
+
+<body>
+
+<h1 id="deviceName">Audio-Pi</h1>
+
+<div class="card">
+    <h2>Volume</h2>
+    <input type="range" min="0" max="100" id="volumeSlider" oninput="setVolume(this.value)">
+    <div id="volumeValue"></div>
+</div>
+
+<div class="card">
+    <h2>Services</h2>
+    <div id="servicesStatus" class="small"></div>
+    <div>
+        <button onclick="service('bluetooth','restart')">Restart Bluetooth</button>
+        <button onclick="service('airplay','restart')">Restart AirPlay</button>
+        <button onclick="service('spotify','restart')">Restart Spotify</button>
+        <button onclick="service('snapserver','restart')">Restart Snapserver</button>
+        <button onclick="service('snapclient','restart')">Restart Snapclient</button>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Multiroom Mode</h2>
+    <button onclick="setMultiroom('server')">Set as Server</button>
+    <button onclick="setMultiroom('client')">Set as Client</button>
+    <div id="multiroomStatus" class="status"></div>
+</div>
+
+<div class="card">
+    <h2>Wi-Fi</h2>
+    <button onclick="scanWifi()">Scan Networks</button>
+    <div id="wifiList" class="small"></div>
+
+    <div style="margin-top:10px;">
+        <input type="text" id="ssidInput" placeholder="SSID">
+        <input type="password" id="passwordInput" placeholder="Password (optional)">
+        <button onclick="connectWifi()">Connect</button>
+    </div>
+
+    <div id="wifiStatus" class="status"></div>
+</div>
+
+<script>
+async function api(path, method="GET", body=null){
+    const options = { method: method };
+    if(body){
+        options.headers = {"Content-Type":"application/json"};
+        options.body = JSON.stringify(body);
+    }
+    const res = await fetch(path, options);
+    return res.json();
+}
+
+async function refresh(){
+    const data = await api('/api/state');
+
+    document.getElementById("deviceName").innerText = data.device_name;
+    document.getElementById("volumeSlider").value = parseInt(data.volume);
+    document.getElementById("volumeValue").innerText = "Volume: " + data.volume;
+
+    const s = data.services;
+    document.getElementById("servicesStatus").innerHTML =
+        `Bluetooth: ${s.bluetooth} |
+         AirPlay: ${s.airplay} |
+         Spotify: ${s.spotify} |
+         Snapserver: ${s.snapserver} |
+         Snapclient: ${s.snapclient}`;
+
+    document.getElementById("multiroomStatus").innerText =
+        `Snapserver: ${s.snapserver} | Snapclient: ${s.snapclient}`;
+}
+
+async function setVolume(value){
+    await api('/api/volume/' + value, "POST");
+}
+
+async function service(name, action){
+    await api('/api/service/' + name + '/' + action, "POST");
+    refresh();
+}
+
+async function setMultiroom(mode){
+    const res = await api('/api/multiroom/' + mode, "POST");
+    document.getElementById("multiroomStatus").innerText =
+        `Snapserver: ${res.snapserver} | Snapclient: ${res.snapclient}`;
+}
+
+async function scanWifi(){
+    const res = await api('/api/wifi/scan');
+    const list = document.getElementById("wifiList");
+    list.innerHTML = "";
+    res.networks.forEach(n => {
+        const div = document.createElement("div");
+        div.innerText = `${n.ssid} (${n.signal}% , ${n.security})`;
+        div.onclick = () => document.getElementById("ssidInput").value = n.ssid;
+        list.appendChild(div);
+    });
+}
+
+async function connectWifi(){
+    const ssid = document.getElementById("ssidInput").value;
+    const password = document.getElementById("passwordInput").value;
+
+    const res = await api('/api/wifi/connect', "POST", {
+        ssid:ssid,
+        password:password
+    });
+
+    document.getElementById("wifiStatus").innerText = res.result || "Attempted connection";
+}
+
+setInterval(refresh, 2000);
+refresh();
+</script>
+
+</body>
+</html>

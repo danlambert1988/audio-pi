@@ -1,103 +1,194 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Audio-Pi installer ==="
-echo "Installs Snapcast + AirPlay (Shairport) and makes Bluetooth discoverable on boot."
+echo "=== Audio-Pi full installer ==="
+echo "Installs: Web UI + Snapcast (multiroom) + AirPlay (Shairport) + Spotify Connect + DLNA renderer"
+echo "Also configures Bluetooth to be discoverable on boot."
 echo
 
-# 1) Packages
-sudo apt update
-sudo apt install -y snapserver snapclient shairport-sync bluez pulseaudio-utils rfkill
+# -----------------------
+# Settings
+# -----------------------
+APP_USER="audio-pi"
+APP_DIR="/opt/audio-pi"
+CFG_DIR="/etc/audio-pi"
+CFG_FILE="${CFG_DIR}/config.json"
+SUDOERS_FILE="/etc/sudoers.d/audio-pi"
+NGINX_SITE_AVAIL="/etc/nginx/sites-available/audio-pi"
+NGINX_SITE_ENABLED="/etc/nginx/sites-enabled/audio-pi"
+WEB_SERVICE="/etc/systemd/system/audio-pi-web.service"
 
-# Android Wi-Fi casting support (DLNA/UPnP renderer)
-sudo apt install -y gmediarender || sudo apt install -y gmrender-resurrect
+REBOOT_REQUIRED=0
 
-sudo systemctl enable gmediarender || sudo systemctl enable gmrender-resurrect
-sudo systemctl restart gmediarender || sudo systemctl restart gmrender-resurrect || true
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Please run as root: sudo $0"
+    exit 1
+  fi
+}
 
-# Try to set a friendly name (works on many builds)
-sudo sh -c 'printf "GMRENDER_FRIENDLY_NAME=Audio-Pi\n" > /etc/default/gmediarender' || true
-sudo systemctl restart gmediarender || sudo systemctl restart gmrender-resurrect || true
+log() { echo -e "\n\033[1;32m==>\033[0m $*"; }
 
-# 2) Force analog audio default (Pi 3.5mm)
-CFG="/boot/firmware/config.txt"
-sudo touch "$CFG"
-sudo grep -q '^dtparam=audio=on' "$CFG" || echo 'dtparam=audio=on' | sudo tee -a "$CFG" >/dev/null
-sudo grep -q '^hdmi_ignore_edid_audio=1' "$CFG" || echo 'hdmi_ignore_edid_audio=1' | sudo tee -a "$CFG" >/dev/null
+# -----------------------
+# 0) Preconditions
+# -----------------------
+require_root
 
-# 3) Make Shairport output to stdout (for Snapserver process source)
-SHAIR="/etc/shairport-sync.conf"
-if [ -f "$SHAIR" ]; then
-  sudo sed -i 's/output_backend *= *"alsa"/output_backend = "stdout"/' "$SHAIR" || true
-  sudo sed -i 's/output_backend *= *"pipe"/output_backend = "stdout"/' "$SHAIR" || true
-  grep -q 'output_backend' "$SHAIR" || echo 'output_backend = "stdout";' | sudo tee -a "$SHAIR" >/dev/null
-else
-  echo "WARN: /etc/shairport-sync.conf not found (package layout may differ)."
+# Determine script directory (repo root expected)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# -----------------------
+# 1) Create service user
+# -----------------------
+if ! id -u "${APP_USER}" >/dev/null 2>&1; then
+  log "Creating service user: ${APP_USER}"
+  useradd -r -m -s /usr/sbin/nologin "${APP_USER}"
 fi
 
-# 4) Configure Snapserver to run shairport-sync as its source
+# -----------------------
+# 2) Install packages
+# -----------------------
+log "Installing packages"
+apt-get update -y
+
+# Core + Web
+apt-get install -y \
+  git rsync curl ca-certificates jq \
+  python3 python3-venv python3-pip \
+  nginx \
+  alsa-utils \
+  mpd mpc \
+  rfkill
+
+# Audio features
+apt-get install -y \
+  snapserver snapclient \
+  shairport-sync \
+  bluetooth bluez bluez-tools \
+  raspotify || true
+
+# DLNA/UPnP renderer (Android casting)
+apt-get install -y gmediarender || apt-get install -y gmrender-resurrect
+
+# Wi-Fi config from UI (optional but requested)
+apt-get install -y network-manager || true
+
+# -----------------------
+# 3) Enable services
+# -----------------------
+log "Enabling base services"
+systemctl enable --now mpd || true
+systemctl enable --now bluetooth || true
+systemctl enable --now shairport-sync || true
+systemctl enable --now snapserver || true
+systemctl enable --now snapclient || true
+
+# Spotify Connect (if installed)
+systemctl enable --now raspotify 2>/dev/null || true
+
+# DLNA renderer (if installed)
+systemctl enable --now gmediarender 2>/dev/null || true
+systemctl enable --now gmrender-resurrect 2>/dev/null || true
+
+# Set friendly name for DLNA renderer if supported
+log "Configuring DLNA friendly name (best effort)"
+if [[ -f /etc/default/gmediarender ]]; then
+  printf "GMRENDER_FRIENDLY_NAME=Audio-Pi\n" > /etc/default/gmediarender || true
+  systemctl restart gmediarender 2>/dev/null || true
+  systemctl restart gmrender-resurrect 2>/dev/null || true
+fi
+
+# -----------------------
+# 4) Audio firmware config (DON'T disable HDMI)
+# -----------------------
+log "Ensuring onboard audio is enabled (safe default)"
+CFG="/boot/firmware/config.txt"
+touch "$CFG"
+if ! grep -q '^dtparam=audio=on' "$CFG"; then
+  echo 'dtparam=audio=on' >> "$CFG"
+  REBOOT_REQUIRED=1
+fi
+# Remove any previous forced HDMI audio disable
+if grep -q '^hdmi_ignore_edid_audio=1' "$CFG"; then
+  sed -i '/^hdmi_ignore_edid_audio=1/d' "$CFG" || true
+  REBOOT_REQUIRED=1
+fi
+
+# -----------------------
+# 5) Shairport -> stdout for Snapserver process source
+# -----------------------
+log "Configuring Shairport to output to stdout for Snapcast"
+SHAIR="/etc/shairport-sync.conf"
+if [[ -f "$SHAIR" ]]; then
+  # best effort - ensure output_backend is stdout
+  sed -i 's/output_backend *= *"alsa"/output_backend = "stdout"/' "$SHAIR" || true
+  sed -i 's/output_backend *= *"pipe"/output_backend = "stdout"/' "$SHAIR" || true
+  if ! grep -q 'output_backend' "$SHAIR"; then
+    echo 'output_backend = "stdout";' >> "$SHAIR"
+  fi
+else
+  echo "WARN: ${SHAIR} not found (package layout may differ)."
+fi
+
+# -----------------------
+# 6) Snapserver stream definition (AirPlay)
+# -----------------------
+log "Configuring Snapserver stream"
 SNAPCONF="/etc/snapserver.conf"
-sudo touch "$SNAPCONF"
-sudo awk '
+touch "$SNAPCONF"
+
+# Remove existing [stream] blocks (keep other sections)
+awk '
   BEGIN{skip=0}
   /^\[stream\]/{skip=1; next}
   /^\[.*\]/{if(skip==1){skip=0}}
   {if(skip==0) print}
-' "$SNAPCONF" | sudo tee "$SNAPCONF.tmp" >/dev/null
-sudo mv "$SNAPCONF.tmp" "$SNAPCONF"
+' "$SNAPCONF" > "${SNAPCONF}.tmp"
+mv "${SNAPCONF}.tmp" "$SNAPCONF"
 
-cat <<'EOF' | sudo tee -a "$SNAPCONF" >/dev/null
+cat <<'EOF' >> "$SNAPCONF"
 
 [stream]
 source = process:///usr/bin/shairport-sync?name=AirPlay&sampleformat=44100:16:2
 EOF
 
-# 5) Bluetooth: ensure service enabled + unblock + keep discoverable
+# -----------------------
+# 7) Bluetooth: discoverable/pairable on boot
+# -----------------------
+log "Configuring Bluetooth discoverable on boot"
 BTCONF="/etc/bluetooth/main.conf"
-if [ -f "$BTCONF" ]; then
-  sudo sed -i 's/^#\?DiscoverableTimeout.*/DiscoverableTimeout = 0/' "$BTCONF" || true
-  # (Optional) Force name if you want:
-  # sudo sed -i 's/^#\?Name.*/Name = Audio-Pi/' "$BTCONF" || true
+if [[ -f "$BTCONF" ]]; then
+  sed -i 's/^#\?DiscoverableTimeout.*/DiscoverableTimeout = 0/' "$BTCONF" || true
 fi
 
-sudo systemctl enable bluetooth
-sudo systemctl start bluetooth || true
+rfkill unblock bluetooth || true
 
-# Unblock Bluetooth if the OS boots it blocked (common on some Pi images)
-sudo rfkill unblock bluetooth || true
-
-# 6) Robust Bluetooth boot script
-sudo mkdir -p /usr/local/bin
-cat <<'EOF' | sudo tee /usr/local/bin/audio-pi-bt.sh >/dev/null
+mkdir -p /usr/local/bin
+cat <<'EOF' > /usr/local/bin/audio-pi-bt.sh
 #!/bin/bash
 set -e
 
-# Give the stack time to come up
 sleep 6
 
-# Unblock in case rfkill defaulted to blocked
 if command -v rfkill >/dev/null 2>&1; then
   rfkill unblock bluetooth || true
 fi
 
-# Wait briefly for controller to appear
 for i in {1..10}; do
   bluetoothctl list | grep -q "Controller" && break
   sleep 1
 done
 
-# Power + pairing + discoverable
 bluetoothctl power on || true
 bluetoothctl agent on || true
 bluetoothctl default-agent || true
 bluetoothctl pairable on || true
 bluetoothctl discoverable on || true
-
 exit 0
 EOF
-sudo chmod +x /usr/local/bin/audio-pi-bt.sh
+chmod +x /usr/local/bin/audio-pi-bt.sh
 
-cat <<'EOF' | sudo tee /etc/systemd/system/audio-pi-bt.service >/dev/null
+cat <<'EOF' > /etc/systemd/system/audio-pi-bt.service
 [Unit]
 Description=Audio-Pi Bluetooth Auto Setup
 After=bluetooth.service
@@ -112,21 +203,158 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable audio-pi-bt.service
+systemctl daemon-reload
+systemctl enable --now audio-pi-bt.service
 
-# 7) Enable streaming services
-sudo systemctl enable shairport-sync
-sudo systemctl enable snapserver
-sudo systemctl enable snapclient
+# -----------------------
+# 8) Install the Web UI app from repo
+# Expect repo contains ./app (FastAPI) and ./scripts (helpers)
+# -----------------------
+log "Installing Audio-Pi Web UI files"
+mkdir -p "${APP_DIR}" "${CFG_DIR}"
 
-# 8) Restart services now (best effort)
-sudo systemctl restart bluetooth || true
-sudo systemctl restart audio-pi-bt.service || true
-sudo systemctl restart shairport-sync || true
-sudo systemctl restart snapserver || true
-sudo systemctl restart snapclient || true
+if [[ ! -d "${SCRIPT_DIR}/app" ]]; then
+  echo "ERROR: Expected '${SCRIPT_DIR}/app' folder in your repo."
+  echo "Create it with app.py, requirements.txt, and static/ files."
+  exit 1
+fi
 
+rsync -a --delete "${SCRIPT_DIR}/app/" "${APP_DIR}/app/"
+if [[ -d "${SCRIPT_DIR}/scripts" ]]; then
+  rsync -a --delete "${SCRIPT_DIR}/scripts/" "${APP_DIR}/scripts/"
+  chmod +x "${APP_DIR}/scripts/"*.sh 2>/dev/null || true
+fi
+
+chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+
+# Default config if missing
+if [[ ! -f "${CFG_FILE}" ]]; then
+  log "Writing default config"
+  cat <<'JSON' > "${CFG_FILE}"
+{
+  "device_name": "Audio-Pi",
+  "default_volume": 35,
+  "features": {
+    "airplay": true,
+    "spotify": true,
+    "bluetooth": true,
+    "multiroom": true,
+    "wifi_config": true
+  },
+  "multiroom": {
+    "mode": "server",
+    "snapcast_latency_ms": 100
+  }
+}
+JSON
+  chmod 644 "${CFG_FILE}"
+fi
+
+# Python venv + requirements
+log "Creating Python venv + installing dependencies"
+python3 -m venv "${APP_DIR}/venv"
+"${APP_DIR}/venv/bin/pip" install --upgrade pip
+"${APP_DIR}/venv/bin/pip" install -r "${APP_DIR}/app/requirements.txt"
+chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/venv"
+
+# -----------------------
+# 9) Sudoers rules for web UI control
+# -----------------------
+log "Installing sudoers rules for Audio-Pi Web UI"
+cat <<'SUDO' > "${SUDOERS_FILE}"
+audio-pi ALL=(root) NOPASSWD: \
+  /bin/systemctl start mpd, /bin/systemctl stop mpd, /bin/systemctl restart mpd, \
+  /bin/systemctl start bluetooth, /bin/systemctl stop bluetooth, /bin/systemctl restart bluetooth, \
+  /bin/systemctl start shairport-sync, /bin/systemctl stop shairport-sync, /bin/systemctl restart shairport-sync, \
+  /bin/systemctl start raspotify, /bin/systemctl stop raspotify, /bin/systemctl restart raspotify, \
+  /bin/systemctl start snapserver, /bin/systemctl stop snapserver, /bin/systemctl restart snapserver, \
+  /bin/systemctl start snapclient, /bin/systemctl stop snapclient, /bin/systemctl restart snapclient, \
+  /usr/bin/nmcli, \
+  /usr/bin/amixer, \
+  /usr/sbin/reboot
+SUDO
+chmod 440 "${SUDOERS_FILE}"
+
+# -----------------------
+# 10) systemd service for Web UI
+# -----------------------
+log "Installing systemd service: audio-pi-web"
+cat <<EOF > "${WEB_SERVICE}"
+[Unit]
+Description=Audio-Pi Web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${APP_USER}
+WorkingDirectory=${APP_DIR}/app
+Environment=AUDIO_PI_CONFIG=${CFG_FILE}
+ExecStart=${APP_DIR}/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now audio-pi-web.service
+
+# -----------------------
+# 11) nginx reverse proxy :80 -> :8080
+# -----------------------
+log "Configuring nginx reverse proxy (port 80 -> 8080)"
+rm -f /etc/nginx/sites-enabled/default || true
+cat <<'NG' > "${NGINX_SITE_AVAIL}"
+server {
+  listen 80 default_server;
+  listen [::]:80 default_server;
+
+  location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  }
+}
+NG
+ln -sf "${NGINX_SITE_AVAIL}" "${NGINX_SITE_ENABLED}"
+nginx -t
+systemctl enable --now nginx
+systemctl restart nginx
+
+# -----------------------
+# 12) Set default volume from config (best effort)
+# -----------------------
+log "Setting default volume"
+VOL="$(jq -r '.default_volume // 35' "${CFG_FILE}" 2>/dev/null || echo 35)"
+amixer -q set Master "${VOL}%" || true
+
+# -----------------------
+# 13) Restart key services (best effort)
+# -----------------------
+log "Restarting services"
+systemctl restart bluetooth || true
+systemctl restart audio-pi-bt.service || true
+systemctl restart shairport-sync || true
+systemctl restart snapserver || true
+systemctl restart snapclient || true
+systemctl restart mpd || true
+systemctl restart audio-pi-web.service || true
+
+# -----------------------
+# Done
+# -----------------------
+IP="$(hostname -I | awk '{print $1}')"
 echo
-echo "=== Done. Rebooting to apply audio config changes... ==="
-sudo reboot
+echo "=== Install complete ==="
+echo "Open: http://${IP}/ (or http://${IP}:8080/)"
+echo "Web service: sudo systemctl status audio-pi-web.service"
+echo
+
+if [[ "${REBOOT_REQUIRED}" == "1" ]]; then
+  echo "A reboot is required to apply audio firmware changes."
+  echo "Rebooting now..."
+  reboot
+fi

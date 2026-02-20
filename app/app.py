@@ -37,11 +37,11 @@ def service_status(name: str) -> str:
 def service_action(name: str, action: str) -> str:
     return sh(f"sudo systemctl {action} {name}")
 
-def get_volume_percent() -> int:
-    out = sh("amixer get Master | grep -oE '[0-9]+%' | head -n1 | tr -d '%'")
+def get_volume():
+    out = sh("amixer -c 1 get PCM | grep -oE '[0-9]+%' | head -n1 | tr -d '%'")
     try:
         return int(out)
-    except Exception:
+    except:
         return 0
 
 class WifiConnect(BaseModel):

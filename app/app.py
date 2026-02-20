@@ -134,13 +134,49 @@ def list_mixers(card: int) -> List[str]:
     return names
 
 
-def detect_mixer() -> Dict[str, Any]:
+def detect_mixer() -> dict:
     """
-    Detect best ALSA card & mixer control.
-    Prefers Pi headphone jack typical controls: PCM/Headphone/Master.
+    Prefer bcm2835 Headphones card if present, then fall back.
     """
     if _DETECTED["card"] is not None and _DETECTED["mixer"] is not None:
         return _DETECTED
+
+    preferred_mixers = ["PCM", "Headphone", "Master", "Digital"]
+
+    # Find card numbers + names
+    # Example aplay -l line: "card 0: Headphones [bcm2835 Headphones], device 0: ..."
+    cards_info = sh("aplay -l 2>/dev/null | sed -n 's/^card \\([0-9]\\+\\): \\([^[]\\+\\)\\[\\([^]]\\+\\)\\].*/\\1|\\3/p'").splitlines()
+    # cards_info -> ["0|bcm2835 Headphones", "1|vc4-hdmi-0", ...]
+
+    # Prefer headphone card if present
+    preferred_cards = []
+    for line in cards_info:
+        try:
+            num_str, name = line.split("|", 1)
+            num = int(num_str.strip())
+            if "Headphones" in name or "bcm2835" in name:
+                preferred_cards.append(num)
+        except:
+            pass
+
+    # Then add all other cards as fallback
+    for c in list_cards():
+        if c not in preferred_cards:
+            preferred_cards.append(c)
+
+    # Now pick the first preferred mixer on the best card
+    for card in preferred_cards:
+        mixers = list_mixers(card)
+        for m in preferred_mixers:
+            if m in mixers:
+                _DETECTED["card"] = card
+                _DETECTED["mixer"] = m
+                return _DETECTED
+
+    # Final fallback
+    _DETECTED["card"] = preferred_cards[0] if preferred_cards else 0
+    _DETECTED["mixer"] = "Master"
+    return _DETECTED
 
     preferred_mixers = ["PCM", "Headphone", "Master", "Digital"]
     for card in list_cards():
